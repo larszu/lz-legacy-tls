@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "LZ Legacy TLS",
   "short_name": "Legacy TLS",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Opens device web interfaces that only speak TLS 1.0/1.1 or old ciphers, through a small local helper.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA64IiZ1yL7+h0RFnppqKZeUF/7N/XMp0gvW9uz0wjktFdmrjrlAxUxu8GTDviDk3auh3fyN4NtliyUvlp+UVzFQQ4PgtkdzGsfhF8HOMcMZDz1uGxnwBXmz6SoGZEN/1vMKLTG0qIN+Hmiq3LH/ewhoAw5OA6XhwTQJKu1CjdV9ZC3uchqSfLvmLDbAoihc2YVkYU11SPGSGdVXlbcotatBmhEhAmvC/0+xhXJpe/0byaryVEoCKwU3AxNe/iyKJinSK2QTkHgfYylOUS/9mK/Gpm33dAWWpjgj6Dr1U5yojc1W9eSpoDpq7ryr+pgCJDsGLVOCX99R7MoUS0IFx2VQIDAQAB",
   "minimum_chrome_version": "116",

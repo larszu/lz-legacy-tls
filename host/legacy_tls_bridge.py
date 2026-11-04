@@ -17,16 +17,37 @@ Only the Python standard library is used.
 from __future__ import annotations
 
 import json
+import re
 import socket
 import ssl
 import struct
 import sys
 import threading
+import time
+from collections import deque
 from urllib.parse import urlsplit
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 HEAD_LIMIT = 64 * 1024
+IDLE_TIMEOUT = 60  # seconds a browser connection may stay open without sending a request
 DROP_RESPONSE_HEADERS = {"strict-transport-security", "public-key-pins", "expect-ct"}
+LOOPBACK_NAMES = ("127.0.0.1", "localhost", "[::1]")
+
+
+def local_name(host: str, port: int = 443) -> str:
+    """Per-device loopback name, e.g. 192.168.2.3 -> 192-168-2-3.localhost.
+
+    Cookies ignore ports, so every bridge on 127.0.0.1 would share one cookie jar.
+    Browsers resolve every *.localhost name to the loopback address, so a name per
+    device keeps sessions of different devices apart."""
+    label = re.sub(r"[^a-z0-9]+", "-", f"{host}-{port}" if port != 443 else host, flags=re.I)
+    return label.strip("-").lower()[:50] + ".localhost"
+
+
+def is_loopback_host(hostport: str) -> bool:
+    name = hostport.rsplit(":", 1)[0] if not hostport.endswith("]") else hostport
+    name = name.lower()
+    return name in LOOPBACK_NAMES or name.endswith(".localhost")
 
 
 # --------------------------------------------------------------------------
@@ -100,7 +121,8 @@ def header(headers: list[tuple[str, str]], name: str) -> str | None:
 class Bridge:
     """One local listener forwarding to one legacy-TLS device."""
 
-    def __init__(self, host: str, port: int = 443, listen_port: int = 0, listen_host: str = "127.0.0.1"):
+    def __init__(self, host: str, port: int = 443, listen_port: int = 0, listen_host: str = "127.0.0.1",
+                 public_name: str | None = None):
         self.host = host
         self.port = port
         self.ctx = legacy_context()
@@ -110,8 +132,20 @@ class Bridge:
         self.srv.listen(64)
         self.listen_host = listen_host
         self.listen_port = self.srv.getsockname()[1]
+        # name the browser should use; requests may still arrive under any loopback name
+        self.public_name = public_name or (listen_host if listen_host != "0.0.0.0" else "127.0.0.1")
+        self.loopback_only = listen_host.startswith("127.") or listen_host in ("localhost", "::1")
         self.tls_version: str | None = None
+        self.cipher: str | None = None
         self.last_error: str | None = None
+        self.started = time.time()
+        self.requests = 0
+        self.active = 0
+        self.failures = 0
+        self.bytes_in = 0          # device -> browser
+        self.bytes_out = 0         # browser -> device
+        self.events: deque = deque(maxlen=60)
+        self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._serve, daemon=True)
 
@@ -122,7 +156,7 @@ class Bridge:
 
     @property
     def local_origin(self) -> str:
-        return f"http://{self.listen_host if self.listen_host != '0.0.0.0' else '127.0.0.1'}:{self.listen_port}"
+        return f"http://{self.public_name}:{self.listen_port}"
 
     def start(self) -> "Bridge":
         self._thread.start()
@@ -141,14 +175,23 @@ class Bridge:
             with socket.create_connection((self.host, self.port), timeout=timeout) as raw:
                 with self.ctx.wrap_socket(raw, server_hostname=self.host) as tls:
                     self.tls_version = tls.version()
+                    self.cipher = tls.cipher()[0]
+                    self.log("probe", f"{tls.version()} / {self.cipher}")
                     return {"ok": True, "tls": tls.version(), "cipher": tls.cipher()[0]}
         except Exception as exc:  # noqa: BLE001 - report everything to the UI
             self.last_error = str(exc)
+            self.log("error", f"probe: {exc}")
             return {"ok": False, "error": str(exc)}
+
+    def log(self, kind: str, text: str, **extra) -> None:
+        self.events.append({"t": time.time(), "kind": kind, "target": self.target, "text": text, **extra})
 
     def info(self) -> dict:
         return {"host": self.host, "port": self.port, "localPort": self.listen_port,
-                "url": self.local_origin + "/", "tls": self.tls_version, "error": self.last_error}
+                "url": self.local_origin + "/", "tls": self.tls_version, "cipher": self.cipher,
+                "error": self.last_error, "requests": self.requests, "active": self.active,
+                "failures": self.failures, "bytesIn": self.bytes_in, "bytesOut": self.bytes_out,
+                "uptime": round(time.time() - self.started)}
 
     # -- internals ----------------------------------------------------------
     def _serve(self) -> None:
@@ -159,16 +202,43 @@ class Bridge:
                 break
             threading.Thread(target=self._handle, args=(client,), daemon=True).start()
 
-    def _upstream(self) -> ssl.SSLSocket:
-        raw = socket.create_connection((self.host, self.port), timeout=15)
-        tls = self.ctx.wrap_socket(raw, server_hostname=self.host)
-        tls.settimeout(None)
-        self.tls_version = tls.version()
-        return tls
+    def _upstream(self, attempts: int = 3) -> ssl.SSLSocket:
+        """TLS connection to the device. Small embedded web servers drop handshakes
+        when a page fires many requests at once, so retry briefly before giving up."""
+        for i in range(attempts):
+            try:
+                raw = socket.create_connection((self.host, self.port), timeout=15)
+                try:
+                    tls = self.ctx.wrap_socket(raw, server_hostname=self.host)
+                except Exception:
+                    raw.close()
+                    raise
+                tls.settimeout(None)
+                self.tls_version = tls.version()
+                return tls
+            except (ssl.SSLError, ConnectionResetError, ConnectionRefusedError, socket.timeout):
+                if i == attempts - 1:
+                    raise
+                time.sleep(0.15 * (i + 1))
+        raise OSError("unreachable")
 
-    def rewrite_request(self, head: bytes) -> tuple[bytes, bool]:
+    def remote_prefixes(self) -> tuple[str, ...]:
+        """Absolute URL prefixes that mean "the device itself" (longest first)."""
+        names = [f"{self.host}:443", self.host] if self.port == 443 else [f"{self.host}:{self.port}"]
+        return tuple(f"{scheme}://{n}" for n in names for scheme in ("https", "http"))
+
+    def rewrite_request(self, head: bytes) -> tuple[bytes, bool, str, str | None]:
+        """Returns (new_head, websocket_upgrade, local_origin, refusal)."""
         start, headers = split_head(head)
         upgrade = (header(headers, "upgrade") or "").lower() == "websocket"
+        browser_host = header(headers, "host") or f"{self.public_name}:{self.listen_port}"
+        local = "http://" + browser_host
+        refusal = None
+        if self.loopback_only and not is_loopback_host(browser_host):
+            refusal = f"unexpected Host {browser_host!r}"  # DNS rebinding
+        origin = header(headers, "origin")
+        if origin and origin != "null" and origin.lower() != local.lower():
+            refusal = f"request from foreign page {origin}"  # another site talking to the bridge
         remote_origin = "https://" + self.target
         out = []
         for k, v in headers:
@@ -177,29 +247,36 @@ class Bridge:
                 v = self.target
             elif kl == "origin":
                 v = remote_origin
-            elif kl == "referer" and v.startswith(self.local_origin):
-                v = remote_origin + v[len(self.local_origin):]
+            elif kl == "referer" and v.lower().startswith(local.lower()):
+                v = remote_origin + v[len(local):]
             elif kl in ("connection", "proxy-connection", "keep-alive") and not upgrade:
                 continue
             out.append((k, v))
         if not upgrade:
             out.append(("Connection", "close"))
-        return join_head(start, out), upgrade
+        return join_head(start, out), upgrade, local, refusal
 
-    def rewrite_response(self, head: bytes, upgrade: bool) -> bytes:
+    def rewrite_url(self, value: str, local: str) -> str:
+        low = value.lower()
+        for prefix in self.remote_prefixes():
+            if low.startswith(prefix.lower()) and (len(value) == len(prefix) or value[len(prefix)] in "/?#"):
+                return local + value[len(prefix):]
+        return value
+
+    def rewrite_response(self, head: bytes, upgrade: bool, local: str | None = None) -> bytes:
+        local = local or self.local_origin
         start, headers = split_head(head)
-        remote = ("https://" + self.target, "http://" + self.target,
-                  "https://" + self.host, "http://" + self.host)
         out = []
         for k, v in headers:
             kl = k.lower()
             if kl in DROP_RESPONSE_HEADERS:
                 continue
-            if kl in ("location", "content-location", "refresh"):
-                for prefix in remote:
-                    if prefix in v:
-                        v = v.replace(prefix, self.local_origin)
-                        break
+            if kl in ("location", "content-location"):
+                v = self.rewrite_url(v, local)
+            elif kl == "refresh":
+                m = re.match(r"(\s*\d+\s*;\s*url\s*=\s*)(.*)", v, re.I)
+                if m:
+                    v = m.group(1) + self.rewrite_url(m.group(2).strip("'\""), local)
             elif kl == "set-cookie":
                 v = rewrite_cookie(v)
             elif kl in ("connection", "keep-alive") and not upgrade:
@@ -211,30 +288,74 @@ class Bridge:
 
     def _handle(self, client: socket.socket) -> None:
         upstream = None
+        t0 = time.time()
+        line, status = "?", "-"
+        counted = [0, 0]
+        busy = False
         try:
-            head, rest = read_head(client)
+            # Browsers open spare connections that may never carry a request.
+            client.settimeout(IDLE_TIMEOUT)
+            try:
+                head, rest = read_head(client)
+            except (socket.timeout, OSError):
+                return
+            client.settimeout(None)
             if not head:
                 return
-            new_head, upgrade = self.rewrite_request(head)
+            busy = True
+            with self._lock:
+                self.active += 1
+            line = head.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+            parts = line.split(" ")
+            line = " ".join(parts[:2]) if len(parts) >= 2 else line
+            new_head, upgrade, local, refusal = self.rewrite_request(head)
+            with self._lock:
+                self.requests += 1
+            if refusal:
+                status = "403"
+                self.log("error", f"refused: {refusal}")
+                body = f"LZ Legacy TLS: {refusal}\n".encode()
+                client.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                               + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body)
+                return
             try:
                 upstream = self._upstream()
             except Exception as exc:  # noqa: BLE001
                 self.last_error = str(exc)
+                status = "502"
+                with self._lock:
+                    self.failures += 1
                 body = f"LZ Legacy TLS: device {self.target} not reachable\n{exc}\n".encode()
                 client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\n"
                                + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body)
                 return
             upstream.sendall(new_head + rest)
+            counted[1] += len(new_head) + len(rest)
             # request body (if any) and later websocket frames: client -> device
-            t = threading.Thread(target=pipe, args=(client, upstream), daemon=True)
+            t = threading.Thread(target=lambda: counted.__setitem__(1, counted[1] + pipe(client, upstream)),
+                                 daemon=True)
             t.start()
             rhead, rrest = read_head(upstream)
             if rhead:
-                client.sendall(self.rewrite_response(rhead, upgrade) + rrest)
-            pipe(upstream, client)
+                status = rhead.split(b"\r\n", 1)[0].split(b" ")[1].decode("latin-1", "replace") \
+                    if b" " in rhead.split(b"\r\n", 1)[0] else "?"
+                out = self.rewrite_response(rhead, upgrade, local) + rrest
+                client.sendall(out)
+                counted[0] += len(out)
+            counted[0] += pipe(upstream, client)
         except Exception as exc:  # noqa: BLE001
             self.last_error = str(exc)
+            status = "ERR"
+            with self._lock:
+                self.failures += 1
         finally:
+            with self._lock:
+                self.active -= 1 if busy else 0
+                self.bytes_in += counted[0]
+                self.bytes_out += counted[1]
+            if line != "?":
+                self.log("request", line, status=status, ms=round((time.time() - t0) * 1000),
+                         bytes=counted[0])
             for s in (client, upstream):
                 if s is not None:
                     try:
@@ -244,19 +365,37 @@ class Bridge:
 
 
 def rewrite_cookie(value: str) -> str:
-    """Drop Domain (cookie now lives on 127.0.0.1); keep the rest."""
+    """Make a device cookie stick to the plain-HTTP loopback bridge.
+
+    Drops Domain (the cookie now lives on the bridge's name) and Secure (the
+    browser talks plain HTTP to the bridge). SameSite=None needs Secure, so it
+    becomes Lax. __Secure-/__Host- cookies must stay Secure; browsers accept them
+    on localhost names."""
     parts = [p.strip() for p in value.split(";")]
-    kept = [parts[0]] + [p for p in parts[1:] if not p.lower().startswith("domain=")]
+    name = parts[0].split("=", 1)[0].strip()
+    keep_secure = name.startswith(("__Secure-", "__Host-"))
+    kept = [parts[0]]
+    for p in parts[1:]:
+        pl = p.lower().replace(" ", "")
+        if pl.startswith("domain="):
+            continue
+        if pl == "secure" and not keep_secure:
+            continue
+        if pl == "samesite=none" and not keep_secure:
+            p = "SameSite=Lax"
+        kept.append(p)
     return "; ".join(kept)
 
 
-def pipe(src: socket.socket, dst: socket.socket) -> None:
+def pipe(src: socket.socket, dst: socket.socket) -> int:
+    n = 0
     try:
         while True:
             data = src.recv(65536)
             if not data:
                 break
             dst.sendall(data)
+            n += len(data)
     except OSError:
         pass
     finally:
@@ -264,6 +403,7 @@ def pipe(src: socket.socket, dst: socket.socket) -> None:
             dst.shutdown(socket.SHUT_WR)
         except OSError:
             pass
+    return n
 
 
 def parse_target(text: str) -> tuple[str, int]:
@@ -281,11 +421,18 @@ def parse_target(text: str) -> tuple[str, int]:
 # --------------------------------------------------------------------------
 
 class NativeHost:
+    """Native Messaging host. "open" runs in a worker thread, because probing an
+    unreachable device can take seconds and must not block status polling."""
+
+    SLOW = {"open"}
+
     def __init__(self, inp=None, out=None):
         self.inp = inp or sys.stdin.buffer
         self.out = out or sys.stdout.buffer
         self.bridges: dict[str, Bridge] = {}
-        self.lock = threading.Lock()
+        self.lock = threading.Lock()          # stdout frames
+        self.bridges_lock = threading.Lock()  # bridge table
+        self.workers: list[threading.Thread] = []
 
     def send(self, msg: dict) -> None:
         data = json.dumps(msg).encode()
@@ -300,33 +447,52 @@ class NativeHost:
         (n,) = struct.unpack("=I", raw)
         return json.loads(self.inp.read(n))
 
+    def bridge_for(self, host: str, port: int, want: int = 0) -> Bridge:
+        key = f"{host}:{port}"
+        with self.bridges_lock:
+            bridge = self.bridges.get(key)
+            if bridge is None:
+                name = local_name(host, port)
+                try:
+                    bridge = Bridge(host, port, want, public_name=name).start()
+                except OSError:
+                    bridge = Bridge(host, port, 0, public_name=name).start()  # preferred port taken
+                self.bridges[key] = bridge
+            return bridge
+
     def handle(self, msg: dict) -> dict:
         cmd = msg.get("cmd")
         if cmd == "hello":
             return {"ok": True, "version": VERSION, "python": sys.version.split()[0],
-                    "ssl": ssl.OPENSSL_VERSION}
+                    "ssl": ssl.OPENSSL_VERSION, "bridges": len(self.bridges)}
         if cmd == "open":
             host, port = parse_target(msg["target"])
-            key = f"{host}:{port}"
-            bridge = self.bridges.get(key)
-            if bridge is None:
-                want = int(msg.get("localPort") or 0)
-                try:
-                    bridge = Bridge(host, port, want).start()
-                except OSError:
-                    bridge = Bridge(host, port, 0).start()  # preferred port taken
-                self.bridges[key] = bridge
+            bridge = self.bridge_for(host, port, int(msg.get("localPort") or 0))
             result = bridge.probe()
             return {**result, **bridge.info()}
         if cmd == "close":
             host, port = parse_target(msg["target"])
-            bridge = self.bridges.pop(f"{host}:{port}", None)
+            with self.bridges_lock:
+                bridge = self.bridges.pop(f"{host}:{port}", None)
             if bridge:
                 bridge.stop()
             return {"ok": True}
         if cmd == "list":
-            return {"ok": True, "bridges": [b.info() for b in self.bridges.values()]}
+            return {"ok": True, "bridges": [b.info() for b in list(self.bridges.values())]}
+        if cmd == "log":
+            since = float(msg.get("since") or 0)
+            bridges = list(self.bridges.values())
+            ev = sorted((e for b in bridges for e in list(b.events) if e["t"] > since), key=lambda e: e["t"])
+            return {"ok": True, "events": ev[-60:], "bridges": [b.info() for b in bridges]}
         return {"ok": False, "error": f"unknown command {cmd!r}"}
+
+    def answer(self, msg: dict) -> None:
+        try:
+            reply = self.handle(msg)
+        except Exception as exc:  # noqa: BLE001
+            reply = {"ok": False, "error": str(exc)}
+        reply["id"] = msg.get("id")
+        self.send(reply)
 
     def run(self) -> None:
         while True:
@@ -337,13 +503,15 @@ class NativeHost:
                 continue
             if msg is None:
                 break
-            try:
-                reply = self.handle(msg)
-            except Exception as exc:  # noqa: BLE001
-                reply = {"ok": False, "error": str(exc)}
-            reply["id"] = msg.get("id")
-            self.send(reply)
-        for b in self.bridges.values():
+            if msg.get("cmd") in self.SLOW:
+                t = threading.Thread(target=self.answer, args=(msg,), daemon=True)
+                t.start()
+                self.workers = [w for w in self.workers if w.is_alive()] + [t]
+            else:
+                self.answer(msg)
+        for t in self.workers:
+            t.join(timeout=10)
+        for b in list(self.bridges.values()):
             b.stop()
 
 
