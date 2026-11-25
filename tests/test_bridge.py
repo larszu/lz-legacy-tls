@@ -283,7 +283,7 @@ class NativeHostTest(unittest.TestCase):
         from_host.close()
 
     def test_local_name(self):
-        self.assertEqual(ltb.local_name("192.168.2.3"), "192-168-2-3.localhost")
+        self.assertEqual(ltb.local_name("192.0.2.3"), "192-0-2-3.localhost")
         self.assertEqual(ltb.local_name("Encoder.local", 8443), "encoder-local-8443.localhost")
 
     def test_parse_target(self):
