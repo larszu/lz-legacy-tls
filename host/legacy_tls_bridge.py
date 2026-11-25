@@ -35,7 +35,7 @@ LOOPBACK_NAMES = ("127.0.0.1", "localhost", "[::1]")
 
 
 def local_name(host: str, port: int = 443) -> str:
-    """Per-device loopback name, e.g. 192.168.2.3 -> 192-168-2-3.localhost.
+    """Per-device loopback name, e.g. 192.0.2.3 -> 192-0-2-3.localhost.
 
     Cookies ignore ports, so every bridge on 127.0.0.1 would share one cookie jar.
     Browsers resolve every *.localhost name to the loopback address, so a name per
